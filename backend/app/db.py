@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     version_id  TEXT REFERENCES versions(id),
     test_delay_ms INTEGER NOT NULL DEFAULT 0,
     worker_id   TEXT,
+    lease_expires_at TEXT,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
@@ -93,6 +94,10 @@ def init_db() -> None:
         # 建表顺序里 images 引用了 versions，需先关掉外键再执行整段脚本。
         conn.execute("PRAGMA foreign_keys=OFF")
         conn.executescript(SCHEMA)
+        # 幂等迁移：旧库的 jobs 表补租约列（滚动更新后老容器可能用旧 schema）。
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}
+        if "lease_expires_at" not in cols:
+            conn.execute("ALTER TABLE jobs ADD COLUMN lease_expires_at TEXT")
         conn.execute("PRAGMA foreign_keys=ON")
     finally:
         conn.close()

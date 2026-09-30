@@ -9,11 +9,13 @@ import hashlib
 import sqlite3
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from . import config, db, imaging, storage
+
+TERMINAL_STATUSES = ("published", "cancelled", "superseded", "failed")
 
 
 class ServiceError(Exception):
@@ -28,7 +30,16 @@ def _uuid() -> str:
 
 
 def now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # 与租约时间戳保持同样的微秒精度：两者都用字符串字典序比较，
+    # 一边有小数秒、一边没有会在同一秒内得出错误的先后顺序。
+    return datetime.now(timezone.utc).isoformat()
+
+
+def lease_expiry(ttl_seconds: float | None = None) -> str:
+    # 必须保留微秒精度：秒级截断会让租约提前将近 1 秒被判过期，
+    # 在滚动更新的交接窗口内可能误判仍存活的 worker 为死亡。
+    ttl = config.LEASE_TTL_SECONDS if ttl_seconds is None else ttl_seconds
+    return (datetime.now(timezone.utc) + timedelta(seconds=ttl)).isoformat()
 
 
 def spec_key(sha256_hex: str, box: tuple[int, int, int, int], target: int) -> str:
@@ -47,29 +58,64 @@ def interruptible_sleep(seconds: float, stop: threading.Event | None) -> bool:
     return stop.wait(timeout=seconds)
 
 
-# ---------------------------------------------------------------- 启动与恢复
+# ---------------------------------------------------------------- 启动与租约
 
 def startup() -> None:
     storage.init_storage()
     db.init_db()
 
 
-def recover_crashed_jobs() -> int:
-    """worker 启动时调用：清理临时文件，把遗留的 processing 作业退回 pending。"""
-    storage.cleanup_tmp()
-    reset = 0
+def requeue_expired_jobs() -> int:
+    """只把**租约已过期**的 processing 作业退回 pending。
+
+    滚动更新时新进程启动，旧进程可能仍存活并持有未过期租约——这些作业
+    绝不能被抢走重复处理；只有确认旧进程已死/停止续租（SIGKILL、卡死、
+    SIGTERM 后停止心跳且 TTL 到期）的作业才重新入队。
+    """
+    ts = now()
     with db.tx() as conn:
         cur = conn.execute(
             """
             UPDATE jobs
                SET status='pending', worker_id=NULL,
-                   updated_at=?
+                   lease_expires_at=NULL, updated_at=?
              WHERE status='processing'
+               AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
             """,
-            (now(),),
+            (ts, ts),
         )
-        reset = cur.rowcount
-    return reset
+        return cur.rowcount
+
+
+def heartbeat(job_id: str, worker_id: str) -> bool:
+    """续租。返回 False 说明该作业已不属于本 worker（被取消或租约过期后
+    被别人重新认领），调用方必须放弃处理、丢弃本地成果。"""
+    with db.tx() as conn:
+        cur = conn.execute(
+            """UPDATE jobs SET lease_expires_at=?, updated_at=updated_at
+                WHERE id=? AND status='processing' AND worker_id=?""",
+            (lease_expiry(), job_id, worker_id),
+        )
+        return cur.rowcount == 1
+
+
+def reconcile(worker_id: str) -> dict[str, int]:
+    """周期性对账：回收过期租约 + 清扫已终态作业留下的临时文件。
+
+    由存活 worker 定期执行（而非只在启动时执行一次），保证 SIGKILL 后
+    不依赖重启也能恢复，且清扫按作业状态判定，不碰其他进程正在写的文件。
+    """
+    reset = requeue_expired_jobs()
+    with db.connect() as conn:
+        terminal = [
+            r[0] for r in conn.execute(
+                f"SELECT id FROM jobs WHERE status IN "
+                f"({','.join('?' for _ in TERMINAL_STATUSES)})",
+                TERMINAL_STATUSES,
+            )
+        ]
+    storage.sweep_tmp(terminal, datetime.now(timezone.utc))
+    return {"reset": reset}
 
 
 def reset_all_for_tests() -> None:
@@ -275,7 +321,8 @@ def cancel_job(job_id: str) -> dict[str, Any]:
         # rowcount 为 0，下面按终态冲突处理。
         cur = conn.execute(
             """UPDATE jobs
-                  SET status='cancelled', worker_id=NULL, updated_at=?
+                  SET status='cancelled', worker_id=NULL,
+                      lease_expires_at=NULL, updated_at=?
                 WHERE id=? AND status IN ('pending','processing')""",
             (now(), job_id),
         )
@@ -306,24 +353,54 @@ def claim_job(worker_id: str) -> dict[str, Any] | None:
         if row is None:
             return None
         cur = conn.execute(
-            """UPDATE jobs SET status='processing', worker_id=?, updated_at=?
+            """UPDATE jobs
+                  SET status='processing', worker_id=?,
+                      lease_expires_at=?, updated_at=?
                 WHERE id=? AND status='pending'""",
-            (worker_id, now(), row["id"]),
+            (worker_id, lease_expiry(), now(), row["id"]),
         )
         if cur.rowcount == 0:
             return None
-        return dict(row)
+        claimed = conn.execute(
+            "SELECT * FROM jobs WHERE id=?", (row["id"],)
+        ).fetchone()
+        return dict(claimed)
 
 
-def process_job(job: dict[str, Any], stop: threading.Event | None = None) -> str:
-    """渲染两个尺寸并一次性发布。返回最终状态。"""
+def process_job(job: dict[str, Any], stop: threading.Event | None = None,
+                worker_id: str | None = None) -> str:
+    """渲染两个尺寸并一次性发布。返回最终状态。
+
+    持有作业租约期间用心跳续租；一旦心跳失败（被取消或租约过期后被别人
+    重新认领）立即放弃，本地 staging 文件全部丢弃，绝不触碰数据库终态与
+    正式产物——这是滚动更新时"旧进程不能污染新进程结果"的关键栅栏。
+    """
+    worker_id = worker_id or job.get("worker_id")
     job_id = job["id"]
+    lease_lost = threading.Event()
+
+    def _renew() -> None:
+        while not lease_lost.wait(config.LEASE_HEARTBEAT_SECONDS):
+            if not heartbeat(job_id, worker_id):
+                lease_lost.set()
+                if stop is not None:
+                    stop.set()
+                return
+
+    hb = threading.Thread(target=_renew, daemon=True)
+    hb.start()
+
     with db.connect() as conn:
         image = conn.execute(
             "SELECT * FROM images WHERE id=?", (job["image_id"],)
         ).fetchone()
     data = Path(image["original_path"]).read_bytes()
     box = (job["crop_x"], job["crop_y"], job["crop_w"], job["crop_h"])
+
+    # 本次尝试独占 staging 文件名；清掉该作业此前尝试的残留（旧进程被
+    # SIGKILL 或已放弃租约时留下的文件），只保留本次新写的文件。
+    attempt = uuid.uuid4().hex[:10]
+    storage.discard_job_attempts(job_id)
 
     delay = max(0, int(job["test_delay_ms"])) / 1000.0
     # 拆成三段：渲染前 / 渲染间隙 / 渲染后，使取消窗口稳定可测。
@@ -333,27 +410,56 @@ def process_job(job: dict[str, Any], stop: threading.Event | None = None) -> str
     try:
         for target in config.SIZES:
             if interruptible_sleep(slice_, stop):
-                return _abandoned(job_id)
+                return _abandon(job_id, worker_id, lease_lost, staged)
             webp, out_w, out_h = imaging.render_webp(
                 data, image["format"], box, target
             )
             key = spec_key(image["sha256"], box, target)
-            tmp = config.TMP_DIR / f"{key}.staging-{job_id}-{target}"
+            tmp = storage.staging_tmp(job_id, attempt, key, target)
             storage.write_staged_deriv(tmp, webp)
             staged.append({"size": target, "key": key, "tmp": tmp,
                            "w": out_w, "h": out_h})
         if interruptible_sleep(slice_, stop):
-            return _abandoned(job_id)
-    except Exception as exc:  # 坏图/编码失败：条件更新为 failed
-        _mark_failed(job_id, str(exc))
+            return _abandon(job_id, worker_id, lease_lost, staged)
+    except Exception as exc:  # 坏图/编码失败：栅栏更新为 failed
+        _mark_failed(job_id, str(exc), worker_id)
         _discard_staging(staged)
         return "failed"
+    finally:
+        lease_lost.set()  # 停心跳
+        hb.join(timeout=1)
 
-    status = publish_rendered(job_id, staged)
-    if status == "cancelled":
-        # 取消先赢：成果不发布，清掉临时文件。
+    status = publish_rendered(job_id, staged, worker_id)
+    if status in ("cancelled", "lease_lost"):
+        # 取消先赢 / 租约已被别人接管：成果不发布，清掉本地临时文件。
         _discard_staging(staged)
     return status
+
+
+def _abandon(job_id: str, worker_id: str | None, lease_lost: threading.Event,
+             staged: list[dict[str, Any]]) -> str:
+    """停机信号或租约丢失打断：不强改终态。
+
+    - 仍持有租约且只是本进程优雅停机：租约会在 TTL 后过期，由对账重新入队；
+    - 租约已丢失（作业已被别的 worker 接管）：只清本地文件，绝不碰数据库。
+    """
+    _discard_staging(staged)
+    if lease_lost.is_set() or not _still_owned(job_id, worker_id):
+        return "lease_lost"
+    return "abandoned"
+
+
+def _still_owned(job_id: str, worker_id: str | None) -> bool:
+    if worker_id is None:
+        return False
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT status, worker_id, lease_expires_at FROM jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+    if row is None or row["status"] != "processing" or row["worker_id"] != worker_id:
+        return False
+    return bool(row["lease_expires_at"] and row["lease_expires_at"] > now())
 
 
 def _discard_staging(staged: list[dict[str, Any]]) -> None:
@@ -364,22 +470,26 @@ def _discard_staging(staged: list[dict[str, Any]]) -> None:
             pass
 
 
-def _abandoned(job_id: str) -> str:
-    """停机信号打断：不改终态，留给下次启动恢复重试。"""
-    return "abandoned"
-
-
-def _mark_failed(job_id: str, error: str) -> None:
+def _mark_failed(job_id: str, error: str, worker_id: str | None = None) -> None:
     with db.tx() as conn:
+        # worker_id 栅栏：只有作业仍归本 worker 时才能写 failed。
+        # 否则旧进程的异常不得把新进程刚认领的重试打成 failed（failed 是
+        # 终态，被误写会永久无法恢复）。
         conn.execute(
-            """UPDATE jobs SET status='failed', error=?, worker_id=NULL, updated_at=?
-                WHERE id=? AND status='processing'""",
-            (error[:500], now(), job_id),
+            """UPDATE jobs SET status='failed', error=?, worker_id=NULL,
+                   lease_expires_at=NULL, updated_at=?
+                WHERE id=? AND status='processing' AND worker_id=?""",
+            (error[:500], now(), job_id, worker_id),
         )
 
 
-def publish_rendered(job_id: str, staged: list[dict[str, Any]]) -> str:
-    """两个尺寸都渲染好之后，在同一个事务内发布。带锁冲突重试。"""
+def publish_rendered(job_id: str, staged: list[dict[str, Any]],
+                     worker_id: str | None = None) -> str:
+    """两个尺寸都渲染好之后，在同一个事务内发布。带锁冲突重试。
+
+    所有作业状态迁移都带 worker_id 栅栏：只有当前租约持有者能发布，
+    旧进程的迟到完成不能改动新进程认领后的作业。
+    """
     last_exc: Exception | None = None
     for attempt in range(3):
         try:
@@ -387,9 +497,11 @@ def publish_rendered(job_id: str, staged: list[dict[str, Any]]) -> str:
                 row = conn.execute(
                     "SELECT * FROM jobs WHERE id=?", (job_id,)
                 ).fetchone()
-                if row["status"] != "processing":
-                    # 取消先赢：丢弃成果，终态已由取消决定。
-                    return row["status"]
+                if row["status"] != "processing" or row["worker_id"] != worker_id:
+                    # 取消先赢（终态已由取消决定）或租约已被别人接管：
+                    # 丢弃成果，绝不用旧进程身份覆盖任何状态。
+                    return (row["status"] if row["status"] != "processing"
+                            else "lease_lost")
 
                 # 文件先落正式位置（内容寻址；崩溃留下孤儿文件也无害、可复用）。
                 for item in staged:
@@ -453,9 +565,9 @@ def publish_rendered(job_id: str, staged: list[dict[str, Any]]) -> str:
                 conn.execute(
                     """UPDATE jobs
                           SET status=?, version_id=?, worker_id=NULL,
-                              updated_at=?
-                        WHERE id=? AND status='processing'""",
-                    (new_status, version_id, ts, job_id),
+                              lease_expires_at=NULL, updated_at=?
+                        WHERE id=? AND status='processing' AND worker_id=?""",
+                    (new_status, version_id, ts, job_id, worker_id),
                 )
                 return new_status
         except sqlite3.OperationalError as exc:

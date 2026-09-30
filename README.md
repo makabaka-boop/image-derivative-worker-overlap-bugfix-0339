@@ -36,9 +36,9 @@ backend/
     db.py        SQLite 连接、schema、BEGIN IMMEDIATE 短事务
     storage.py   原图/派生图内容寻址落盘、临时文件暂存与启动清理
     imaging.py   图片解码校验、裁切合法性、等比 WebP 渲染
-    service.py   业务核心：上传去重、作业申请、取消、领取、一次性发布
+    service.py   业务核心：上传去重、作业申请、取消、领取、租约心跳、一次性发布
     main.py      FastAPI 路由
-    worker.py    轮询/并发执行循环、信号处理、崩溃恢复
+    worker.py    轮询/并发执行循环、租约心跳/对账、信号处理、优雅退出与过期恢复
   tests/         pytest 验收用例（HTTP 黑盒 + 崩溃恢复子进程）
   Dockerfile
 web/
@@ -99,11 +99,30 @@ UPDATE images SET current_version_id=?
 以后选回该参数可立即复用，但页面当前版本不变。前端另外用 `currentJobId`
 丢弃迟到的旧轮询响应，双重防止旧响应回写。
 
-### 崩溃重启恢复
+### 滚动更新与崩溃恢复：租约 + 心跳 + 栅栏
 
-worker 启动时先清空 `tmp/`，再把所有 `processing` 作业无条件退回 `pending`，
-随后正常认领重试。派生图内容寻址 + `INSERT OR IGNORE` 使重试安全：
-崩溃前已落正式位置的文件会被复用，数据库里不会出现重复行。
+worker 认领作业时写入 `worker_id` 与 `lease_expires_at`，渲染期间按
+`LEASE_HEARTBEAT_SECONDS` 心跳续租；worker 启动时与运行中每隔
+`RECONCILE_INTERVAL_SECONDS` 都做对账，**只**把租约已过期（TTL 默认 10s）的
+`processing` 作业退回 `pending`。因此滚动更新时：
+
+- 新进程启动**不会**抢走旧进程仍在处理的作业（旧进程心跳维持、租约未过期），
+  从根上避免同一张图被新旧两个进程重复处理；
+- 被 SIGKILL / 卡死的 worker 停止心跳，租约到期后由任意存活 worker 对账恢复，
+  不依赖"必须重启"；
+- 发布与失败的 UPDATE 都带 `AND status='processing' AND worker_id=?` 栅栏，
+  旧进程的迟到完成/异常不能改动已被新进程接管的作业（尤其防止旧异常把重试
+  误写成终态 `failed`）；心跳一旦发现自己不再持有租约，立即中断渲染并丢弃
+  本地 staging，不发布任何成果；
+- 临时文件不再整目录清空（启动清空会删掉活进程正在用的文件和正在上传的
+  原图）：staging 名含 `作业id+随机尝试token`，重新认领时先确定性删除该作业
+  旧尝试的残留，周期对账再清扫已终态作业的残留；无主临时文件按年龄回收；
+- SIGTERM 后 worker 停止认领新作业，给在途作业 `SHUTDOWN_GRACE_SECONDS`
+  （默认 8s，小于 compose 的 10s 宽限期）做完并正常发布；做不完的作业心跳
+  停止、租约到期后重试。
+
+派生图内容寻址 + `INSERT OR IGNORE` 使重试安全：崩溃前已落正式位置的文件
+会被复用，数据库里不会出现重复行。
 
 ### 输入校验
 
