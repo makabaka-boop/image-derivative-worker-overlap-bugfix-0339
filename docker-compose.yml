@@ -1,0 +1,68 @@
+services:
+  api:
+    build:
+      context: ./backend
+    image: imgcrop-app:latest
+    environment:
+      DATA_DIR: /data
+      TEST_HOOKS: "1"
+    volumes:
+      - data:/data
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).status==200 else 1)"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./backend
+    image: imgcrop-app:latest
+    environment:
+      DATA_DIR: /data
+      WORKER_CONCURRENCY: "2"
+      TEST_HOOKS: "1"
+    volumes:
+      - data:/data
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 10s
+
+  web:
+    build:
+      context: ./web
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  # 一次性验收测试服务：docker compose run --rm verify
+  verify:
+    profiles: ["verify"]
+    image: imgcrop-app:latest
+    build:
+      context: ./backend
+    working_dir: /verify
+    environment:
+      BASE_URL: http://api:8000
+      DATA_DIR: /tmp/recovery-data
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ./backend/tests:/verify:ro
+    command: ["python", "-m", "pytest", "-p", "no:cacheprovider", "-q", "/verify"]
+    depends_on:
+      api:
+        condition: service_healthy
+      worker:
+        condition: service_started
+
+volumes:
+  data:

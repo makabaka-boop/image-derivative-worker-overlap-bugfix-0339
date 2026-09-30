@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Node
+node_modules/
+web/dist/
+
+# 本地运行数据（compose 使用命名卷，不会落在这里）
+data/
+*.db
+*.db-wal
+*.db-shm
