@@ -1,13 +1,21 @@
 """API 与 worker 共用的业务逻辑层。
 
-所有作业状态迁移都经过条件更新（WHERE status=...），并由 BEGIN IMMEDIATE
-串行化，保证：取消与完成竞争只有一个终态；旧作业迟到完成不会覆盖较新选择。
+作业状态迁移的关键不变量：
+
+- **租约（lease）**：worker 认领作业后获得带过期时间的租约，心跳线程
+  按 TTL/3 续租。只有租约过期的 processing 作业才允许被接管；滚动更新时
+  新旧进程并存，仍在续租的活作业绝不能被重新入队重复处理。
+- **围栏令牌（fence）**：每次认领/接管/释放都让 fence+1。心跳、置失败、
+  发布全部带 `worker_id + fence` 守卫，旧持有者即使迟到完成，所有写操作
+  都不会命中——不可能把新进程已发布的作业打回 failed 或写出半成品。
+- **取消/发布串行化**：均由 BEGIN IMMEDIATE 与条件更新保证只有一个终态。
 """
 from __future__ import annotations
 
 import hashlib
 import sqlite3
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +29,14 @@ class ServiceError(Exception):
         super().__init__(message)
         self.status = status
         self.code = code
+
+
+class LostLease(Exception):
+    """作业已不再归本 worker 所有（被取消、被接管或被停机释放）。
+
+    调用方必须放弃本次处理：不动作业终态、不删别人的文件，
+    留给当前持有者或下次重试。
+    """
 
 
 def _uuid() -> str:
@@ -37,16 +53,6 @@ def spec_key(sha256_hex: str, box: tuple[int, int, int, int], target: int) -> st
     return hashlib.sha256(raw).hexdigest()
 
 
-def interruptible_sleep(seconds: float, stop: threading.Event | None) -> bool:
-    """返回 True 表示被要求停止。"""
-    if seconds <= 0:
-        return bool(stop and stop.is_set())
-    if stop is None:
-        threading.Event().wait(seconds)
-        return False
-    return stop.wait(timeout=seconds)
-
-
 # ---------------------------------------------------------------- 启动与恢复
 
 def startup() -> None:
@@ -55,21 +61,80 @@ def startup() -> None:
 
 
 def recover_crashed_jobs() -> int:
-    """worker 启动时调用：清理临时文件，把遗留的 processing 作业退回 pending。"""
-    storage.cleanup_tmp()
-    reset = 0
+    """worker 启动时调用：把无有效持有者的遗留作业退回 pending。
+
+    滚动更新期间旧 worker 可能仍在正常续租，这些作业**不能动**；
+    只回收两类：
+      1. 老版本遗留、没有租约信息（lease_until IS NULL）的 processing 作业；
+      2. 租约已经过期、持有者确实死掉/卡住的作业。
+    临时文件不清空整个 tmp/：接管具体作业时只清该作业的旧 staging，
+    活 worker 正在写的文件与 API 正在上传的原图临时文件因此不会被误删。
+    """
+    return _requeue_expired(reason="启动恢复")
+
+
+def _requeue_expired(reason: str) -> int:
+    now_ts = time.time()
     with db.tx() as conn:
-        cur = conn.execute(
+        ids = [
+            r["id"]
+            for r in conn.execute(
+                """SELECT id FROM jobs
+                    WHERE status='processing'
+                      AND (lease_until IS NULL OR lease_until < ?)""",
+                (now_ts,),
+            ).fetchall()
+        ]
+        if not ids:
+            return 0
+        conn.execute(
             """
             UPDATE jobs
-               SET status='pending', worker_id=NULL,
-                   updated_at=?
+               SET status='pending', worker_id=NULL, lease_until=NULL,
+                   fence=fence+1, updated_at=?
              WHERE status='processing'
+               AND (lease_until IS NULL OR lease_until < ?)
             """,
-            (now(),),
+            (now(), now_ts),
         )
-        reset = cur.rowcount
-    return reset
+    # 事务外按作业清理旧持有者的 staging：能走到这里说明租约已过期、
+    # 没有活持有者；下一个认领者会用全新文件名重写。
+    for job_id in ids:
+        storage.discard_job_staging(job_id)
+    print(f"[recovery] {reason}：回收过期/遗留作业 {len(ids)} 个", flush=True)
+    return len(ids)
+
+
+def heartbeat_job(job_id: str, worker_id: str, fence: int) -> bool:
+    """续租。仅当作业仍归本 worker（worker_id+fence 匹配且在 processing）
+    时成功；返回 False 表示归属已丢失，worker 应立即放弃。"""
+    until = time.time() + config.WORKER_LEASE_TTL_SECONDS
+    with db.tx() as conn:
+        cur = conn.execute(
+            """UPDATE jobs SET lease_until=?
+                WHERE id=? AND status='processing'
+                  AND worker_id=? AND fence=?""",
+            (until, job_id, worker_id, fence),
+        )
+        return cur.rowcount == 1
+
+
+def release_job(job_id: str, worker_id: str, fence: int) -> bool:
+    """优雅停机：把自己仍持有的作业交回队列，围栏令牌作废。
+
+    旧进程在滚动更新结束前释放租约，新进程可立刻认领而不必等租约超时。
+    已被取消/接管/发布的作业 rowcount=0，不触碰。
+    """
+    with db.tx() as conn:
+        cur = conn.execute(
+            """UPDATE jobs
+                  SET status='pending', worker_id=NULL, lease_until=NULL,
+                      fence=fence+1, updated_at=?
+                WHERE id=? AND status='processing'
+                  AND worker_id=? AND fence=?""",
+            (now(), job_id, worker_id, fence),
+        )
+        return cur.rowcount == 1
 
 
 def reset_all_for_tests() -> None:
@@ -272,10 +337,12 @@ def cancel_job(job_id: str) -> dict[str, Any]:
                 "作业已进入终态，无法取消", status=409, code="terminal"
             )
         # pending / processing 都由条件更新兜底；若发布事务先提交，
-        # rowcount 为 0，下面按终态冲突处理。
+        # rowcount 为 0，下面按终态冲突处理。同时清空 worker_id/租约并
+        # 推进 fence，持有者下一次心跳/发布即因归属不匹配而放弃。
         cur = conn.execute(
             """UPDATE jobs
-                  SET status='cancelled', worker_id=NULL, updated_at=?
+                  SET status='cancelled', worker_id=NULL, lease_until=NULL,
+                      fence=fence+1, updated_at=?
                 WHERE id=? AND status IN ('pending','processing')""",
             (now(), job_id),
         )
@@ -297,63 +364,182 @@ def cancel_job(job_id: str) -> dict[str, Any]:
 # ---------------------------------------------------------------- worker 执行
 
 def claim_job(worker_id: str) -> dict[str, Any] | None:
+    """认领一个 pending 作业，或接管租约过期的 processing 作业。
+
+    两类候选在同一事务里按时间排序，状态迁移全部带条件更新（防并发双领），
+    fence 每易主一次 +1。接管时在事务外清掉旧持有者的 staging 文件——
+    那只会是过期 worker 的遗留物（活持有者的文件名带不同 fence 且作业
+    不会被接管）。
+
+    兜底：submit 的“查版本 → 查在途 → 插入”之间存在窗口，极端情况下
+    同参数可能漏建出第二个在途作业。认领时若同参数版本已由更早的作业
+    发布，就把这个冗余作业直接收敛到该版本（published），不再渲染，
+    从根上杜绝重复版本。
+    """
+    now_ts = time.time()
     with db.tx() as conn:
         row = conn.execute(
             """SELECT * FROM jobs
                 WHERE status='pending'
-                ORDER BY created_at ASC, id ASC LIMIT 1"""
+                   OR (status='processing' AND lease_until < ?)
+                ORDER BY created_at ASC, id ASC LIMIT 1""",
+            (now_ts,),
         ).fetchone()
         if row is None:
             return None
+
+        version = conn.execute(
+            """SELECT id FROM versions
+                WHERE image_id=? AND crop_x=? AND crop_y=?
+                  AND crop_w=? AND crop_h=?""",
+            (row["image_id"], row["crop_x"], row["crop_y"],
+             row["crop_w"], row["crop_h"]),
+        ).fetchone()
+        if version is not None:
+            # 同参数版本已被另一个在途作业抢先发布：冗余作业直接复用它。
+            done = conn.execute(
+                """UPDATE jobs
+                      SET status='published', version_id=?, worker_id=NULL,
+                          lease_until=NULL, updated_at=?
+                    WHERE id=? AND status IN ('pending','processing')
+                      AND (status='pending' OR lease_until < ?)""",
+                (version["id"], now(), row["id"], now_ts),
+            )
+            if done.rowcount == 1:
+                return None  # 本拍无可执行作业，循环继续认领下一个。
+
+        reclaimed = row["status"] == "processing"
+        lease_until = now_ts + config.WORKER_LEASE_TTL_SECONDS
         cur = conn.execute(
-            """UPDATE jobs SET status='processing', worker_id=?, updated_at=?
-                WHERE id=? AND status='pending'""",
-            (worker_id, now(), row["id"]),
+            """UPDATE jobs
+                  SET status='processing', worker_id=?, lease_until=?,
+                      fence=fence+1, updated_at=?
+                WHERE id=?
+                  AND (status='pending'
+                       OR (status='processing' AND lease_until < ?))""",
+            (worker_id, lease_until, now(), row["id"], now_ts),
         )
         if cur.rowcount == 0:
             return None
-        return dict(row)
-
-
-def process_job(job: dict[str, Any], stop: threading.Event | None = None) -> str:
-    """渲染两个尺寸并一次性发布。返回最终状态。"""
-    job_id = job["id"]
-    with db.connect() as conn:
-        image = conn.execute(
-            "SELECT * FROM images WHERE id=?", (job["image_id"],)
+        fresh = conn.execute(
+            "SELECT * FROM jobs WHERE id=?", (row["id"],)
         ).fetchone()
-    data = Path(image["original_path"]).read_bytes()
-    box = (job["crop_x"], job["crop_y"], job["crop_w"], job["crop_h"])
+        job = dict(fresh)
+        job["_reclaimed"] = reclaimed
+    if reclaimed:
+        storage.discard_job_staging(job["id"])
+    return job
 
-    delay = max(0, int(job["test_delay_ms"])) / 1000.0
-    # 拆成三段：渲染前 / 渲染间隙 / 渲染后，使取消窗口稳定可测。
-    slice_ = delay / (len(config.SIZES) + 1)
 
+def process_job(
+    job: dict[str, Any],
+    worker_id: str,
+    stop: threading.Event | None = None,
+) -> str:
+    """渲染两个尺寸并一次性发布。返回最终状态。
+
+    期间由独立心跳线程续租；若续租失败（作业被取消/被新 worker 接管）
+    立即抛 LostLease 放弃——不写终态、不覆盖别人的文件。
+    """
+    job_id = job["id"]
+    fence = int(job["fence"])
+    lease_lost = threading.Event()
+    heartbeat_stop = threading.Event()
+
+    def _beat() -> None:
+        interval = config.WORKER_HEARTBEAT_INTERVAL_SECONDS
+        while not heartbeat_stop.wait(interval):
+            try:
+                if not heartbeat_job(job_id, worker_id, fence):
+                    lease_lost.set()
+                    return
+            except sqlite3.Error:
+                # 偶发锁竞争/数据库抖动：下一拍再试，连续失败由租约超时兜底。
+                pass
+
+    beater = threading.Thread(target=_beat, name=f"hb-{job_id[:8]}", daemon=True)
+    beater.start()
+
+    # 在外层声明：无论是停机还是丢租约中断，本进程自己写的 staging 都要
+    # 在 finally 里清掉（接管者使用不同围栏的文件名，绝不会误删别人的）。
     staged: list[dict[str, Any]] = []
     try:
-        for target in config.SIZES:
-            if interruptible_sleep(slice_, stop):
-                return _abandoned(job_id)
-            webp, out_w, out_h = imaging.render_webp(
-                data, image["format"], box, target
-            )
-            key = spec_key(image["sha256"], box, target)
-            tmp = config.TMP_DIR / f"{key}.staging-{job_id}-{target}"
-            storage.write_staged_deriv(tmp, webp)
-            staged.append({"size": target, "key": key, "tmp": tmp,
-                           "w": out_w, "h": out_h})
-        if interruptible_sleep(slice_, stop):
-            return _abandoned(job_id)
-    except Exception as exc:  # 坏图/编码失败：条件更新为 failed
-        _mark_failed(job_id, str(exc))
-        _discard_staging(staged)
-        return "failed"
+        conn = db.connect()
+        try:
+            image = conn.execute(
+                "SELECT * FROM images WHERE id=?", (job["image_id"],)
+            ).fetchone()
+        finally:
+            conn.close()
+        data = Path(image["original_path"]).read_bytes()
+        box = (job["crop_x"], job["crop_y"], job["crop_w"], job["crop_h"])
 
-    status = publish_rendered(job_id, staged)
-    if status == "cancelled":
-        # 取消先赢：成果不发布，清掉临时文件。
+        delay = max(0, int(job["test_delay_ms"])) / 1000.0
+        # 拆成三段：渲染前 / 渲染间隙 / 渲染后，使取消窗口稳定可测。
+        slice_ = delay / (len(config.SIZES) + 1)
+
+        try:
+            for target in config.SIZES:
+                _interruptible(slice_, stop, lease_lost)
+                webp, out_w, out_h = imaging.render_webp(
+                    data, image["format"], box, target
+                )
+                key = spec_key(image["sha256"], box, target)
+                # 每次渲染生成全新唯一文件名：同一作业被接管重跑、两个进程
+                # 并存时绝不共用临时路径，不可能互相截断或删除。
+                tmp = storage.staging_path(key, job_id, target, fence)
+                storage.write_staged_deriv(tmp, webp)
+                staged.append({"size": target, "key": key, "tmp": tmp,
+                               "w": out_w, "h": out_h})
+            _interruptible(slice_, stop, lease_lost)
+        except Exception as exc:
+            if isinstance(exc, (_Shutdown, LostLease)):
+                raise
+            # 坏图/编码失败：仅持有者可置 failed。
+            _mark_failed(job_id, worker_id, fence, str(exc))
+            return "failed"
+
+        # 发布成功时文件已被 os.replace 移走；取消/丢租约/停机时由 finally
+        # 统一清理仍在磁盘上的 staging。
+        return publish_rendered(job_id, worker_id, fence, staged)
+    except _Shutdown:
+        return _abandoned(job_id)
+    except LostLease:
+        return "abandoned"
+    finally:
         _discard_staging(staged)
-    return status
+        heartbeat_stop.set()
+        beater.join(timeout=1)
+
+
+class _Shutdown(Exception):
+    """收到停机信号，等待外层统一释放租约。"""
+
+
+def _interruptible(
+    seconds: float,
+    stop: threading.Event | None,
+    lease_lost: threading.Event,
+) -> None:
+    """睡眠等待，同时响应停机与丢租约；每 50ms 检查一次归属。"""
+    if seconds <= 0:
+        if stop is not None and stop.is_set():
+            raise _Shutdown
+        if lease_lost.is_set():
+            raise LostLease
+        return
+    deadline = time.monotonic() + seconds
+    while True:
+        if stop is not None and stop.is_set():
+            raise _Shutdown
+        if lease_lost.is_set():
+            raise LostLease
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        stop.wait(min(0.05, remaining)) if stop is not None else time.sleep(
+            min(0.05, remaining)
+        )
 
 
 def _discard_staging(staged: list[dict[str, Any]]) -> None:
@@ -365,21 +551,34 @@ def _discard_staging(staged: list[dict[str, Any]]) -> None:
 
 
 def _abandoned(job_id: str) -> str:
-    """停机信号打断：不改终态，留给下次启动恢复重试。"""
+    """停机信号打断：不改终态，停机流程把租约交回 pending（崩溃则等超时接管）。"""
     return "abandoned"
 
 
-def _mark_failed(job_id: str, error: str) -> None:
+def _mark_failed(
+    job_id: str, worker_id: str, fence: int, error: str
+) -> None:
     with db.tx() as conn:
         conn.execute(
-            """UPDATE jobs SET status='failed', error=?, worker_id=NULL, updated_at=?
-                WHERE id=? AND status='processing'""",
-            (error[:500], now(), job_id),
+            """UPDATE jobs SET status='failed', error=?, worker_id=NULL,
+                              lease_until=NULL, updated_at=?
+                WHERE id=? AND status='processing'
+                  AND worker_id=? AND fence=?""",
+            (error[:500], now(), job_id, worker_id, fence),
         )
 
 
-def publish_rendered(job_id: str, staged: list[dict[str, Any]]) -> str:
-    """两个尺寸都渲染好之后，在同一个事务内发布。带锁冲突重试。"""
+def publish_rendered(
+    job_id: str,
+    worker_id: str,
+    fence: int,
+    staged: list[dict[str, Any]],
+) -> str:
+    """两个尺寸都渲染好之后，在同一个事务内发布。
+
+    全程带 worker_id+fence 围栏守卫：旧持有者迟到发布时 rowcount 全部为 0，
+    直接放弃。带锁冲突重试。
+    """
     last_exc: Exception | None = None
     for attempt in range(3):
         try:
@@ -387,9 +586,13 @@ def publish_rendered(job_id: str, staged: list[dict[str, Any]]) -> str:
                 row = conn.execute(
                     "SELECT * FROM jobs WHERE id=?", (job_id,)
                 ).fetchone()
-                if row["status"] != "processing":
-                    # 取消先赢：丢弃成果，终态已由取消决定。
-                    return row["status"]
+                if (
+                    row["status"] != "processing"
+                    or row["worker_id"] != worker_id
+                    or row["fence"] != fence
+                ):
+                    # 取消先赢、已被接管或易主：丢弃成果，终态由别人决定。
+                    raise LostLease(job_id)
 
                 # 文件先落正式位置（内容寻址；崩溃留下孤儿文件也无害、可复用）。
                 for item in staged:
@@ -397,6 +600,8 @@ def publish_rendered(job_id: str, staged: list[dict[str, Any]]) -> str:
                     if item["tmp"].exists():
                         storage.publish_deriv(item["tmp"], dst)
                     if not dst.exists():
+                        # 自己的临时文件不可能被别人删（名字唯一）；缺失说明
+                        # 磁盘异常，直接失败而不是写出缺尺寸的版本。
                         raise RuntimeError("派生图文件丢失")
                     item["path"] = str(dst)
 
@@ -450,14 +655,21 @@ def publish_rendered(job_id: str, staged: list[dict[str, Any]]) -> str:
                     (version_id, row["image_id"], job_id),
                 )
                 new_status = "published" if guard.rowcount == 1 else "superseded"
-                conn.execute(
+                done = conn.execute(
                     """UPDATE jobs
                           SET status=?, version_id=?, worker_id=NULL,
-                              updated_at=?
-                        WHERE id=? AND status='processing'""",
-                    (new_status, version_id, ts, job_id),
+                              lease_until=NULL, updated_at=?
+                        WHERE id=? AND status='processing'
+                          AND worker_id=? AND fence=?""",
+                    (new_status, version_id, ts, job_id, worker_id, fence),
                 )
+                if done.rowcount == 0:
+                    # 事务内文件已替换但归属刚好丢失：回滚数据库改动，
+                    # 磁盘成果留待复用，调用方按放弃处理。
+                    raise LostLease(job_id)
                 return new_status
+        except LostLease:
+            raise
         except sqlite3.OperationalError as exc:
             last_exc = exc
             threading.Event().wait(0.1 * (attempt + 1))

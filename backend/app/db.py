@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     version_id  TEXT REFERENCES versions(id),
     test_delay_ms INTEGER NOT NULL DEFAULT 0,
     worker_id   TEXT,
+    lease_until REAL,
+    fence       INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
@@ -94,8 +96,21 @@ def init_db() -> None:
         conn.execute("PRAGMA foreign_keys=OFF")
         conn.executescript(SCHEMA)
         conn.execute("PRAGMA foreign_keys=ON")
+        _migrate(conn)
     finally:
         conn.close()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """老版本数据库补列/索引；新库已由 SCHEMA 建齐。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)")}
+    if "lease_until" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN lease_until REAL")
+    if "fence" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN fence INTEGER NOT NULL DEFAULT 0")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_jobs_lease ON jobs(status, lease_until)"
+    )
 
 
 @contextmanager
